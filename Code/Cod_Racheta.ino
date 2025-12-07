@@ -2,15 +2,53 @@
 #include <TinyGPS++.h>
 #include <HardwareSerial.h>
 
+
 const int MPU_ADDR = 0x68;    //  Adresa default pentru MPU6050, se poate transforma in 0x69 daca pinul AD0 e legat la 3.3v
 
 TinyGPSPlus gps;    //  Initializam obiect gps
 HardwareSerial SerialGPS(2);    //  Initializam comunicare pe serial 2
-long GPS_Lat, GPS_Long;
+double GPS_Lat, GPS_Long;
+
+// --- HM-TRLR-TTL-433 / config-mode pins ---
+const int LORA_SLEEP_PIN = 25;    // LoRa SLEEP -> ESP32 GPIO
+const int LORA_RESET_PIN = 26;    // LoRa RESET -> ESP32 GPIO
+const int LORA_CONFIG_PIN = 27;   // LoRa CONFIG (enter config when LOW)
+
+// LoRa serial (UART1)
+HardwareSerial SerialLoRa(1);
+const int LORA_RX_PIN = 4;  // LoRa TX -> ESP32 RX
+const int LORA_TX_PIN = 5;  // LoRa RX <- ESP32 TX
+const uint32_t LORA_BAUD = 9600;
+
+// LoRa configuration commands to send in config mode
+const String loraConfigCommands[] = {
+  "AT",            // basic handshake
+  "AT+SPR=3",      // set UART speed (SPR=3 -> 9600 bps)
+  "AT+POWER=0",    // set TX power to 20 dBm (module encoding: 0 -> 20dBm)
+  "AT+SYNL=6",     // 6-byte syncword length
+  "AT+NODE=0,0",   // disable node ID function
+  "AT+LRCRC=1",    // LoRa with CRC enabled
+  "AT+LRSBW=7",    // SBW code 7 -> 125 kHz
+  "AT+LRSF=9",     // spreading factor 9
+  "AT+LRCR=0",     // coding rate 4/5 (module encoding 0)
+  "AT+LRHF=0",     // FHSS disabled
+  "AT+LRPL=32",    // packet length 32 bytes
+  "AT+LRHPV=10",   // hopping period 10
+  "AT+LRFSV=1638", // frequency step value for 100 kHz step (module-specific encoding)
+  "AT+MODE=0",     // LoRa mode
+  "AT+BAND=0"      // 433 MHz band (module encoding: 0)
+};
+
+const size_t loraConfigCommandsCount = sizeof(loraConfigCommands) / sizeof(loraConfigCommands[0]);    // number of commands
+
 
 // Offsets pentru calibrare
 long AcX_off = 0, AcY_off = 0, AcZ_off = 0;
 long GyX_off = 0, GyY_off = 0, GyZ_off = 0;
+
+// Latest converted sensor values (filled by readMPU)
+float AcX_g_val = 0, AcY_g_val = 0, AcZ_g_val = 0;
+float GyX_dps_val = 0, GyY_dps_val = 0, GyZ_dps_val = 0;
 
 // Pini GPS si baud rate
 static const int RXPin = 17;  // GPS TX → ESP32 RX
@@ -102,10 +140,19 @@ void readMPU(){
   float AcY_g = AcY / 2048;
   float AcZ_g = AcZ / 2048;
 
+  // store latest
+  AcX_g_val = AcX_g;
+  AcY_g_val = AcY_g;
+  AcZ_g_val = AcZ_g;
+
   // Conversie pentru dps
   float GyX_dps = GyX / 131.0;
   float GyY_dps = GyY / 131.0;
   float GyZ_dps = GyZ / 131.0;
+
+  GyX_dps_val = GyX_dps;
+  GyY_dps_val = GyY_dps;
+  GyZ_dps_val = GyZ_dps;
 
   // Print rezultate
   Serial.print("Acc (g): X=");
@@ -144,9 +191,126 @@ void readGPS(){
   }
 }
 
+// Helper: toggle pins to enter config mode
+void enterLoRaConfigMode() {
+  pinMode(LORA_SLEEP_PIN, OUTPUT);
+  pinMode(LORA_RESET_PIN, OUTPUT);
+  pinMode(LORA_CONFIG_PIN, OUTPUT);
+
+  // 1) Pull sleep LOW
+  digitalWrite(LORA_SLEEP_PIN, LOW);
+  // 2) Pull reset HIGH
+  digitalWrite(LORA_RESET_PIN, HIGH);
+  delay(2);
+  // 3) Pull config LOW for at least 5 ms
+  digitalWrite(LORA_CONFIG_PIN, LOW);
+  delay(8); // keep slightly longer than 5ms
+  // Keep pins as-is while sending AT commands
+}
+
+void exitLoRaConfigMode() {
+  // Release config pin (set HIGH) and allow module normal operation
+  digitalWrite(LORA_CONFIG_PIN, HIGH);
+  // Optionally put sleep pin HIGH to allow normal operation
+  digitalWrite(LORA_SLEEP_PIN, HIGH);
+}
+
+// Send an AT command and wait for expected substring. Returns true if found.
+bool sendATCommand(const String &cmd, const String &expect, unsigned long timeout = 500) {
+  while (SerialLoRa.available()) SerialLoRa.read();
+  Serial.print("-> LoRa AT: "); Serial.println(cmd);
+  SerialLoRa.println(cmd);
+  unsigned long start = millis();
+  String resp = "";
+  while (millis() - start < timeout) {
+    while (SerialLoRa.available()) {
+      char c = SerialLoRa.read();
+      resp += c;
+    }
+    if (expect.length() > 0 && resp.indexOf(expect) >= 0) {
+      Serial.print("<- LoRa resp: "); Serial.println(resp);
+      return true;
+    }
+    delay(10);
+  }
+  Serial.print("<- LoRa resp timeout (got): "); Serial.println(resp);
+  return false;
+}
+
+// Initialize LoRa UART and, if requested, enter config-mode and run AT commands.
+void initLoRa() {
+  Serial.print("Init LoRa UART on RX="); Serial.print(LORA_RX_PIN);
+  Serial.print(" TX="); Serial.print(LORA_TX_PIN);
+  Serial.print(" @"); Serial.println(LORA_BAUD);
+
+  SerialLoRa.begin(LORA_BAUD, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
+  delay(200);
+
+  // Enter config mode by toggling SLEEP/RESET/CONFIG pins as documented
+  enterLoRaConfigMode();
+  delay(50); // give the module a moment
+
+  // Run configured AT command list (best-effort).
+  Serial.println("LoRa: sending automatic config sequence (best-effort).\n");
+  for (size_t i = 0; i < loraConfigCommandsCount; ++i) {
+    String cmd = loraConfigCommands[i];
+    sendATCommand(cmd, "OK", 1000);
+    delay(100);
+  }
+
+  // Leave config mode to normal operation
+  exitLoRaConfigMode();
+  Serial.println("LoRa: config sequence completed (see logs for responses).\n");
+  Serial.println("If commands did not match your module's firmware, enter interactive mode:\n  - Open Serial Monitor at 115200\n  - Type 'c' then press Enter to enter LoRa interactive config shell\n  - Type 'q' then Enter to exit the shell\");
+}
+
+// Interactive forwarder: read from USB Serial and forward lines to the LoRa UART
+// while printing responses back. Exit when user sends a line with just 'q'.
+
+void interactiveLoRaShell() {
+  Serial.println("-- Entering LoRa interactive config shell. Type 'q' to quit --");
+  while (true) {
+    // Forward any user input to LoRa
+    if (Serial.available()) {
+      String line = Serial.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) continue;
+      if (line == "q") {
+        Serial.println("-- Exiting interactive shell --");
+        break;
+      }
+      // Ensure module is in config mode while user configures
+      enterLoRaConfigMode();
+      SerialLoRa.println(line);
+      Serial.print("-> "); Serial.println(line);
+      unsigned long start = millis();
+      String resp = "";
+      while (millis() - start < 1000) {
+        while (SerialLoRa.available()) {
+          char c = SerialLoRa.read();
+          resp += c;
+        }
+        if (resp.length()) break;
+      }
+      Serial.print("<- "); Serial.println(resp);
+      exitLoRaConfigMode();
+    }
+    // Also print any unsolicited responses from LoRa
+    if (SerialLoRa.available()) {
+      String r = "";
+      while (SerialLoRa.available()) r += (char)SerialLoRa.read();
+      Serial.print("<- "); Serial.println(r);
+    }
+    delay(10);
+  }
+}
+
+
 void setup() {
   Serial.begin(115200);
   Wire.begin();
+  // Initialize LoRa UART and (optionally) run AT configuration sequence
+  initLoRa();
   //  Configuram si calibram MPU
   configMPU();
   calibrateMPU();
@@ -159,7 +323,29 @@ void setup() {
 }
 
 void loop() {
+  // Check for user request to enter interactive LoRa config shell
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "c") {
+      interactiveLoRaShell();
+    }
+  }
+
   readMPU();    //  Citim acc si gyr
   readGPS();    //  Citim lat si lng
+
+  // Build telemetry payload (compact JSON-like)
+  String payload = "{";
+  payload += "lat:" + String(GPS_Lat, 6) + ",";
+  payload += "lon:" + String(GPS_Long, 6) + ",";
+  payload += "ax:" + String(AcX_g_val, 3) + ",ay:" + String(AcY_g_val, 3) + ",az:" + String(AcZ_g_val, 3) + ",";
+  payload += "gx:" + String(GyX_dps_val, 2) + ",gy:" + String(GyY_dps_val, 2) + ",gz:" + String(GyZ_dps_val, 2);
+  payload += "}";
+
+  // Send over LoRa UART (transparent write)
+  SerialLoRa.println(payload);
+  Serial.print("LoRa payload: "); Serial.println(payload);
+
   delay(50);
 }

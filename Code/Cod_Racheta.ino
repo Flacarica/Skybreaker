@@ -261,7 +261,7 @@ void initLoRa() {
   // Leave config mode to normal operation
   exitLoRaConfigMode();
   Serial.println("LoRa: config sequence completed (see logs for responses).\n");
-  Serial.println("If commands did not match your module's firmware, enter interactive mode:\n  - Open Serial Monitor at 115200\n  - Type 'c' then press Enter to enter LoRa interactive config shell\n  - Type 'q' then Enter to exit the shell\");
+  Serial.println("If commands did not match your module's firmware, enter interactive mode:\n  - Open Serial Monitor at 115200\n  - Type 'c' then press Enter to enter LoRa interactive config shell\n  - Type 'q' then Enter to exit the shell");
 }
 
 // Interactive forwarder: read from USB Serial and forward lines to the LoRa UART

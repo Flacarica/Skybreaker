@@ -212,7 +212,7 @@ void exitLoRaConfigMode() {
   // Release config pin (set HIGH) and allow module normal operation
   digitalWrite(LORA_CONFIG_PIN, HIGH);
   // Optionally put sleep pin HIGH to allow normal operation
-  digitalWrite(LORA_SLEEP_PIN, HIGH);
+  digitalWrite(LORA_SLEEP_PIN, LOW);
 }
 
 // Send an AT command and wait for expected substring. Returns true if found.
